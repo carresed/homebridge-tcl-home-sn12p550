@@ -59,7 +59,7 @@ Approximate mapping:
 Until this fork is published to npm, install it from GitHub after creating the repository:
 
 ```bash
-npm install -g git+https://github.com/YOUR_GITHUB_USERNAME/homebridge-tcl-home-sn12p550.git
+npm install -g git+https://github.com/carresed/homebridge-tcl-home-sn12p550.git
 ```
 
 If you publish it to npm later:
