@@ -1,7 +1,7 @@
 {
-  "name": "homebridge-tcl-home",
+  "name": "homebridge-tcl-home-sn12p550",
   "version": "1.1.16",
-  "description": "Homebridge plugin for TCL Home air conditioners with real-time updates - supports P09F4CSW1K and similar models",
+  "description": "Homebridge plugin fork for TCL SN12P550 / P09F4CSW1K air conditioners",
   "main": "index.js",
   "scripts": {
     "test": "echo \"No tests specified\" && exit 0"
@@ -29,12 +29,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/5at0ri/homebridge-tcl-home.git"
+    "url": "git+https://github.com/YOUR_GITHUB_USERNAME/homebridge-tcl-home-sn12p550.git"
   },
   "bugs": {
-    "url": "https://github.com/5at0ri/homebridge-tcl-home/issues"
+    "url": "https://github.com/YOUR_GITHUB_USERNAME/homebridge-tcl-home-sn12p550/issues"
   },
-  "homepage": "https://github.com/5at0ri/homebridge-tcl-home#readme",
-  "author": "Your Name <naxulus11@gmail.com>",
+  "homepage": "https://github.com/YOUR_GITHUB_USERNAME/homebridge-tcl-home-sn12p550#readme",
+  "author": "5at0ri and contributors; SN12P550 fork maintained by YOUR_GITHUB_USERNAME",
   "license": "MIT"
 }

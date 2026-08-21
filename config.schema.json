@@ -3,7 +3,7 @@
   "pluginType": "platform",
   "singular": true,
   "headerDisplay": "TCL Home plugin for Homebridge - Control your TCL air conditioners through HomeKit",
-  "footerDisplay": "For support and documentation, visit: [GitHub Repository](https://github.com/5at0ri/homebridge-tcl-home)",
+  "footerDisplay": "For support and documentation, visit: [GitHub Repository](https://github.com/YOUR_GITHUB_USERNAME/homebridge-tcl-home-sn12p550)",
   "schema": {
     "type": "object",
     "properties": {
