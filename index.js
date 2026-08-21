@@ -306,7 +306,9 @@ class TclHomeApi {
         // Use targetCelsiusDegree instead of targetTemperature!
         const state = {
           powerSwitch: desired.powerSwitch !== undefined ? desired.powerSwitch : (reported.powerSwitch || 0),
-          targetTemperature: desired.targetCelsiusDegree !== undefined ? desired.targetCelsiusDegree : (reported.targetCelsiusDegree || reported.targetTemperature || 24),
+          targetTemperature: reported.targetCelsiusDegree !== undefined
+  ? reported.targetCelsiusDegree
+  : (reported.targetTemperature !== undefined ? reported.targetTemperature : 24),
           currentTemperature: reported.currentTemperature || 22,
           workMode: desired.workMode !== undefined ? desired.workMode : (reported.workMode || 0),
           windSpeed: desired.windSpeed !== undefined ? desired.windSpeed : (reported.windSpeed || 1),
@@ -371,6 +373,7 @@ class TclHomeApi {
 
       const success = await this.publishToAwsIot(topic, JSON.stringify(payload));
       
+      this.log.info(`🌡️ TEMP DEBUG: sent properties = ${JSON.stringify(properties)}`);
       if (success) {
         if (!this.currentDeviceState[deviceId]) {
           this.currentDeviceState[deviceId] = {};
@@ -511,9 +514,12 @@ class TclHomeApi {
         });
       });
 
+      
       client.on('message', (receivedTopic, message) => {
+      this.log.info(`📨 MQTT RAW [${deviceId}] TOPIC=${receivedTopic} PAYLOAD=${message.toString()}`);
         try {
           const data = JSON.parse(message.toString());
+          this.log.info(`🔬 MQTT RAW ${receivedTopic}: ${message.toString()}`);
           this.debug(`📨 Live update from ${deviceId}:`, data);
           
           if (receivedTopic === shadowTopic && data.state && data.state.reported) {
@@ -654,12 +660,12 @@ class TclAirConditioner {
 
     this.service.setCharacteristic(this.platform.api.hap.Characteristic.Name, device.deviceName);
 
-    this.sleepService = this.accessory.getService('Sleep Mode') ||
-                       this.accessory.addService(this.platform.api.hap.Service.Switch, 'Sleep Mode', 'sleep');
-
-    this.sleepService.getCharacteristic(this.platform.api.hap.Characteristic.On)
-      .onGet(this.getSleepMode.bind(this))
-      .onSet(this.setSleepMode.bind(this));
+    // Sleep Mode intentionally removed from HomeKit.
+    // The TCL Sleep function is not exposed by this plugin.
+    const oldSleepService = this.accessory.getService('Sleep Mode');
+    if (oldSleepService) {
+      this.accessory.removeService(oldSleepService);
+    }
 
     // Remove old services if they exist
     const oldFanService = this.accessory.getService('Fan Speed');
@@ -778,23 +784,30 @@ class TclAirConditioner {
       targetState = this.platform.api.hap.Characteristic.TargetHeatingCoolingState.OFF;
     } else {
       // Current state - what the device is actually doing
-      switch (state.workMode) {
-        case 0: // AC cooling mode (now maps to HomeKit COOL)
-          currentState = this.platform.api.hap.Characteristic.CurrentHeatingCoolingState.COOL;
-          targetState = this.platform.api.hap.Characteristic.TargetHeatingCoolingState.COOL;
-          this.enableTemperatureControl();
-          break;
-        case 2: // Pure fan mode (now maps to HomeKit AUTO)
-          currentState = this.platform.api.hap.Characteristic.CurrentHeatingCoolingState.COOL; // HomeKit uses COOL for active fan
-          targetState = this.platform.api.hap.Characteristic.TargetHeatingCoolingState.AUTO;
-          this.disableTemperatureControl();
-          break;
-        // Skip workMode 1 and 3 (dehumidify modes we don't want)
-        default:
-          currentState = this.platform.api.hap.Characteristic.CurrentHeatingCoolingState.OFF;
-          targetState = this.platform.api.hap.Characteristic.TargetHeatingCoolingState.OFF;
-          break;
-      }
+     switch (state.workMode) {
+  case 0: // TCL SN12P550: AUTO
+    currentState = this.platform.api.hap.Characteristic.CurrentHeatingCoolingState.COOL;
+    targetState = this.platform.api.hap.Characteristic.TargetHeatingCoolingState.AUTO;
+    this.disableTemperatureControl();
+    break;
+
+  case 1: // TCL SN12P550: COOL
+    currentState = this.platform.api.hap.Characteristic.CurrentHeatingCoolingState.COOL;
+    targetState = this.platform.api.hap.Characteristic.TargetHeatingCoolingState.COOL;
+    this.enableTemperatureControl();
+    break;
+
+  case 2: // TCL SN12P550: DRY
+    currentState = this.platform.api.hap.Characteristic.CurrentHeatingCoolingState.COOL;
+    targetState = this.platform.api.hap.Characteristic.TargetHeatingCoolingState.AUTO;
+    this.enableTemperatureControl();
+    break;
+
+  default:
+    currentState = this.platform.api.hap.Characteristic.CurrentHeatingCoolingState.OFF;
+    targetState = this.platform.api.hap.Characteristic.TargetHeatingCoolingState.OFF;
+    break;
+}
     }
     
     this.service.updateCharacteristic(
@@ -809,40 +822,32 @@ class TclAirConditioner {
     
     this.platform.tclApi.debug(`🔄 Mode update: Device=${state.workMode}, HomeKit Target=${targetState === 3 ? 'AUTO' : targetState === 1 ? 'COOL' : 'OFF'}`);
     
-    // Update sleep mode
-    this.sleepService.updateCharacteristic(
-      this.platform.api.hap.Characteristic.On,
-      state.sleep === 1
-    );
-    
-    // Update single intelligent fan control
-    const isFanActive = state.powerSwitch === 1 && (state.workMode === 0 || state.workMode === 2);
-    this.fanService.updateCharacteristic(
-      this.platform.api.hap.Characteristic.On,
-      isFanActive
-    );
-    
-    if (isFanActive) {
-      // Context-aware speed display: F1=100%, F2/Auto=50%
+    // Fan speed display.
+    // Fan speed must NEVER change the TCL operating mode.
+    if (state.powerSwitch === 1) {
       let fanSpeed;
+
+      // TCL SN12P550:
+      // Auto = 0
+      // Speed 1/2 = 2
+      // Speed 3 = 3
+      // Speed 4 = 4
+      // Speed 5 = 5
+      // Speed 6/7 = 6
       switch (state.windSpeed) {
-        case 1: fanSpeed = 100; break;  // F1 = 100% (High speed)
-        case 2:
-        case 0:
-        default: fanSpeed = 50; break;   // F2/Auto = 50% (Low speed)
+        case 0: fanSpeed = 0; break;
+        case 2: fanSpeed = 20; break;
+        case 3: fanSpeed = 33; break;
+        case 4: fanSpeed = 50; break;
+        case 5: fanSpeed = 67; break;
+        case 6: fanSpeed = 100; break;
+        default: fanSpeed = 0; break;
       }
-      
+
       this.fanService.updateCharacteristic(
         this.platform.api.hap.Characteristic.RotationSpeed,
         fanSpeed
       );
-      
-      // Store speed in appropriate context
-      if (state.workMode === 2) {
-        this.fanModeFanSpeed = state.windSpeed;
-      } else if (state.workMode === 0) {
-        this.coolModeFanSpeed = state.windSpeed;
-      }
     } else {
       this.fanService.updateCharacteristic(
         this.platform.api.hap.Characteristic.RotationSpeed,
@@ -951,15 +956,18 @@ class TclAirConditioner {
       }
       
       switch (state.workMode) {
-        case 0: // AC cooling mode (maps to HomeKit COOL)
-          return this.platform.api.hap.Characteristic.CurrentHeatingCoolingState.COOL;
-        case 2: // Pure fan mode (maps to HomeKit AUTO)
-          // Fan mode shows as running (COOL) not off
-          return this.platform.api.hap.Characteristic.CurrentHeatingCoolingState.COOL;
-        // Skip workMode 1 and 3 (dehumidify modes we don't want)
-        default:
-          return this.platform.api.hap.Characteristic.CurrentHeatingCoolingState.OFF;
-      }
+  case 0: // TCL SN12P550: AUTO
+    return this.platform.api.hap.Characteristic.CurrentHeatingCoolingState.COOL;
+
+  case 1: // TCL SN12P550: COOL
+    return this.platform.api.hap.Characteristic.CurrentHeatingCoolingState.COOL;
+
+  case 2: // TCL SN12P550: DRY
+    return this.platform.api.hap.Characteristic.CurrentHeatingCoolingState.COOL;
+
+  default:
+    return this.platform.api.hap.Characteristic.CurrentHeatingCoolingState.OFF;
+}
     } catch (error) {
       this.log.error('❌ Error getting current state:', error.message);
       return this.platform.api.hap.Characteristic.CurrentHeatingCoolingState.OFF;
@@ -974,14 +982,18 @@ class TclAirConditioner {
       }
       
       switch (state.workMode) {
-        case 0: // AC cooling mode (maps to HomeKit COOL)
-          return this.platform.api.hap.Characteristic.TargetHeatingCoolingState.COOL;
-        case 2: // Pure fan mode (maps to HomeKit AUTO)
-          return this.platform.api.hap.Characteristic.TargetHeatingCoolingState.AUTO;
-        // Skip workMode 1 and 3 (dehumidify modes we don't want)
-        default:
-          return this.platform.api.hap.Characteristic.TargetHeatingCoolingState.OFF;
-      }
+  case 0: // TCL SN12P550: AUTO
+    return this.platform.api.hap.Characteristic.TargetHeatingCoolingState.AUTO;
+
+  case 1: // TCL SN12P550: COOL
+    return this.platform.api.hap.Characteristic.TargetHeatingCoolingState.COOL;
+
+  case 2: // TCL SN12P550: DRY
+    return this.platform.api.hap.Characteristic.TargetHeatingCoolingState.AUTO;
+
+  default:
+    return this.platform.api.hap.Characteristic.TargetHeatingCoolingState.OFF;
+}
     } catch (error) {
       this.log.error('❌ Error getting target state:', error.message);
       return this.platform.api.hap.Characteristic.TargetHeatingCoolingState.OFF;
@@ -999,41 +1011,60 @@ class TclAirConditioner {
 
       switch (value) {
         case Characteristic.TargetHeatingCoolingState.OFF:
-          properties = { 
-            powerSwitch: 0 
+          properties = {
+            powerSwitch: 0
           };
-          this.log.info(`❄️ Setting AC to OFF`);
+          this.log.info(`⛔ Setting AC to OFF`);
           this.enableTemperatureControl();
           break;
-          
-        case Characteristic.TargetHeatingCoolingState.COOL:
-          // Get current target temperature to preserve it
-          const currentState = await this.platform.tclApi.getDeviceState(this.device.deviceId, true);
+
+        case Characteristic.TargetHeatingCoolingState.COOL: {
+          const currentState = await this.platform.tclApi.getDeviceState(
+            this.device.deviceId,
+            true
+          );
+
           const targetTemp = currentState?.targetTemperature || 24;
-          
+          const windSpeed = currentState?.windSpeed ?? 0;
+
           properties = {
             powerSwitch: 1,
-            workMode: 0, // Use mode 0 for AC cooling
-            windSpeed: this.coolModeFanSpeed, // Use saved cool mode speed
-            targetCelsiusDegree: targetTemp, // Ensure temperature is set
+            workMode: 1,
+            windSpeed: windSpeed,
+            targetCelsiusDegree: targetTemp,
             ECO: 0,
             sleep: 0,
             turbo: 0,
             silenceSwitch: 0
           };
-          this.log.info(`❄️ Setting AC to COOL mode (AC cooling) with saved fan speed F${this.coolModeFanSpeed} and temp ${targetTemp}°C`);
+
+          this.log.info(
+            `❄️ Setting AC to COOL: temp=${targetTemp}°C, windSpeed=${windSpeed}`
+          );
           this.enableTemperatureControl();
           break;
-          
-        case Characteristic.TargetHeatingCoolingState.AUTO:
+        }
+
+        case Characteristic.TargetHeatingCoolingState.AUTO: {
+          const currentState = await this.platform.tclApi.getDeviceState(
+            this.device.deviceId,
+            true
+          );
+
+          const windSpeed = currentState?.windSpeed ?? 0;
+
           properties = {
             powerSwitch: 1,
-            workMode: 2, // Use mode 2 for pure fan mode
-            windSpeed: this.fanModeFanSpeed  // Use saved fan mode speed
+            workMode: 0,
+            windSpeed: windSpeed
           };
-          this.log.info(`💨 Setting AC to AUTO mode (pure fan) with saved fan speed F${this.fanModeFanSpeed}`);
-          this.disableTemperatureControl();
+
+          this.log.info(
+            `🔄 Setting AC to AUTO: windSpeed=${windSpeed}`
+          );
+          this.enableTemperatureControl();
           break;
+        }
       }
 
       // Attempt command with multiple retries for critical state changes
@@ -1115,62 +1146,85 @@ class TclAirConditioner {
     }
   }
 
-  async setTargetTemperature(value) {
+    async setTargetTemperature(value) {
     try {
       const temperature = Math.max(18, Math.min(30, Math.round(value)));
-      
-      // Get current state to check if device is on and in cooling mode
-      const currentState = await this.platform.tclApi.getDeviceState(this.device.deviceId);
-      
-      let properties = {
-        targetCelsiusDegree: temperature
-      };
-      
-      // If device is off or not in cooling mode, turn it on in cooling mode
-      if (!currentState || !currentState.powerSwitch || currentState.workMode !== 0) {
-        this.log.info(`🌡️ Setting temperature to ${temperature}°C and switching to cooling mode`);
+
+      const currentState = await this.platform.tclApi.getDeviceState(
+        this.device.deviceId,
+        true
+      );
+
+      let properties;
+
+      if (!currentState || !currentState.powerSwitch) {
         properties = {
           powerSwitch: 1,
-          workMode: 0, // Cooling mode
-          windSpeed: this.coolModeFanSpeed,
-          targetCelsiusDegree: temperature
+          workMode: 1,
+          windSpeed: currentState?.windSpeed ?? 0,
+          targetTemperature: temperature
         };
+
+        this.log.info(
+          `🌡️ Setting temperature to ${temperature}°C and turning AC ON in COOL mode`
+        );
       } else {
-        this.log.info(`🌡️ Setting temperature to ${temperature}°C`);
+        properties = {
+          targetTemperature: temperature
+        };
+
+        this.log.info(
+          `🌡️ Setting temperature to ${temperature}°C, preserving workMode=${currentState.workMode}`
+        );
       }
 
       const success = await this.executeWithAWSRetry(
-        () => this.platform.tclApi.setDeviceState(this.device.deviceId, properties),
+        () => this.platform.tclApi.setDeviceState(
+          this.device.deviceId,
+          properties
+        ),
         'setTargetTemperature'
       );
 
       if (success) {
-        // Update cache
         if (!this.platform.tclApi.currentDeviceState[this.device.deviceId]) {
           this.platform.tclApi.currentDeviceState[this.device.deviceId] = {};
         }
+
         this.platform.tclApi.currentDeviceState[this.device.deviceId].targetTemperature = temperature;
 
-        // Force HomeKit update
-        this.service.getCharacteristic(this.platform.api.hap.Characteristic.TargetTemperature).updateValue(temperature);
+        this.service
+          .getCharacteristic(this.platform.api.hap.Characteristic.TargetTemperature)
+          .updateValue(temperature);
 
         this.log.info(`✅ Temperature set to ${temperature}°C`);
-        
-        // Force immediate status update after 1 second
+
         setTimeout(async () => {
           try {
-            const newState = await this.platform.tclApi.getDeviceState(this.device.deviceId);
+            const newState = await this.platform.tclApi.getDeviceState(
+              this.device.deviceId,
+              true
+            );
+
             if (newState) {
               this.updateHomeKitFromState(newState);
             }
           } catch (error) {
-            this.platform.tclApi.debug('Error in delayed temperature status update:', error.message);
+            this.platform.tclApi.debug(
+              'Error in delayed temperature status update:',
+              error.message
+            );
           }
         }, 1000);
       }
+
+      return success;
+
     } catch (error) {
       this.log.error('❌ Error setting target temperature:', error.message);
-      throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+      throw new this.platform.api.hap.HapStatusError(
+        this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE
+      );
     }
   }
 
@@ -1197,7 +1251,7 @@ class TclAirConditioner {
       if (value && (!currentState || !currentState.powerSwitch)) {
         properties = {
           powerSwitch: 1,
-          workMode: 0, // Default to cooling mode
+          workMode: 1, // TCL SN12P550: cooling mode
           windSpeed: this.coolModeFanSpeed,
           sleep: 1
         };
@@ -1232,9 +1286,13 @@ class TclAirConditioner {
 
   async getFanOn() {
     try {
-      const state = await this.platform.tclApi.getDeviceState(this.device.deviceId);
-      // Fan is "on" when device is powered and in supported modes (AC cooling or pure fan)
-      return state ? (state.powerSwitch === 1 && (state.workMode === 0 || state.workMode === 2)) : false;
+      const state = await this.platform.tclApi.getDeviceState(
+        this.device.deviceId
+      );
+
+      // Fan control is only an indicator when the AC is powered.
+      // It must not reinterpret any TCL workMode.
+      return state ? state.powerSwitch === 1 : false;
     } catch (error) {
       this.log.error('❌ Error getting fan state:', error.message);
       return false;
@@ -1243,202 +1301,162 @@ class TclAirConditioner {
 
   async setFanOn(value) {
     try {
-      let success = false;
-      
-      // Force fresh state check for fan operations
-      const currentState = await this.platform.tclApi.getDeviceState(this.device.deviceId, true);
-      this.log.info(`🔍 Fan command - Current state: Power=${currentState?.powerSwitch}, Mode=${currentState?.workMode}`);
-      
+      const currentState = await this.platform.tclApi.getDeviceState(
+        this.device.deviceId,
+        true
+      );
+
+      if (!currentState) {
+        throw new Error('Unable to read current AC state');
+      }
+
       if (value) {
-        if (!currentState || !currentState.powerSwitch) {
-          // Device is off, turn on in pure fan mode (mode 2)
-          this.log.info(`💨 AC FAN: Turning ON device in pure fan mode`);
-          const properties = {
-            powerSwitch: 1,
-            workMode: 2, // Pure fan mode
-            windSpeed: this.fanModeFanSpeed
-          };
-          
-          // Multiple retry attempts for critical power-on operations
-          for (let attempt = 1; attempt <= 3; attempt++) {
-            success = await this.executeWithAWSRetry(
-              () => this.platform.tclApi.setDeviceState(this.device.deviceId, properties),
-              `setFanOn (attempt ${attempt})`
-            );
-            if (success) break;
-            if (attempt < 3) {
-              this.log.warn(`🔄 Fan ON failed, retrying (attempt ${attempt + 1}/3)`);
-              await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
-            }
-          }
-        } else {
-          // Device is already on, keep current mode
-          this.log.info(`💨 AC FAN: Device already on in mode ${currentState.workMode}`);
-          success = true;
-        }
-      } else {
-        // Turn off entire device - this is the critical fix for the off command
-        this.log.info(`💨 AC FAN: Turning OFF device (CRITICAL: Force OFF regardless of current state)`);
-        const properties = {
-          powerSwitch: 0
-        };
-        
-        // Multiple retry attempts for critical power-off operations
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          success = await this.executeWithAWSRetry(
-            () => this.platform.tclApi.setDeviceState(this.device.deviceId, properties),
-            `setFanOff (attempt ${attempt})`
-          );
-          
-          // Additional verification for OFF command
-          if (success) {
-            setTimeout(async () => {
-              try {
-                const verifyState = await this.platform.tclApi.getDeviceState(this.device.deviceId, true);
-                if (verifyState && verifyState.powerSwitch !== 0) {
-                  this.log.warn(`⚠️ OFF command verification failed, device still shows Power=${verifyState.powerSwitch}`);
-                  if (attempt < 3) {
-                    this.log.info(`🔄 Retrying OFF command (attempt ${attempt + 1}/3)`);
-                  }
-                } else {
-                  this.log.info(`✅ OFF command verified successfully`);
-                }
-              } catch (error) {
-                this.platform.tclApi.debug('OFF verification error:', error.message);
-              }
-            }, 2000);
-            break;
-          }
-          
-          if (attempt < 3) {
-            this.log.warn(`🔄 Fan OFF failed, retrying (attempt ${attempt + 1}/3)`);
-            await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
-          }
-        }
+        // Do NOT turn the AC on and do NOT change workMode.
+        // The Thermostat controls power and operating mode.
+        this.log.info(
+          `💨 AC FAN: Fan control enabled, keeping Power=${currentState.powerSwitch}, Mode=${currentState.workMode}`
+        );
+        return;
       }
-      
-      if (success) {
-        // Force immediate status update with longer delay for verification
-        setTimeout(async () => {
-          try {
-            const newState = await this.platform.tclApi.getDeviceState(this.device.deviceId, true);
-            if (newState) {
-              this.updateHomeKitFromState(newState);
-              this.log.info(`🔍 Final fan state verification: Power=${newState.powerSwitch}, Mode=${newState.workMode}`);
-            }
-          } catch (error) {
-            this.platform.tclApi.debug('Error in delayed fan status update:', error.message);
-          }
-        }, 2000);
-      } else {
-        this.log.error(`❌ All fan command attempts failed`);
-        throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
-      }
+
+      // Do NOT power off the AC from the fan service.
+      // Power is controlled exclusively by the Thermostat.
+      this.log.info(
+        `💨 AC FAN: Fan control disabled, keeping Power=${currentState.powerSwitch}, Mode=${currentState.workMode}`
+      );
     } catch (error) {
       this.log.error('❌ Error setting fan state:', error.message);
-      throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+      throw new this.platform.api.hap.HapStatusError(
+        this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE
+      );
     }
   }
 
-  async getRotationSpeed() {
+    async getRotationSpeed() {
     try {
       const state = await this.platform.tclApi.getDeviceState(this.device.deviceId);
+
       if (!state || !state.powerSwitch) {
-        return 0; // Fan is off if device is off
+        return 0;
       }
-      
-      // Show fan speed for supported modes only (AC cooling and pure fan)
-      if (state.workMode === 0 || state.workMode === 2) {
-        // Context-aware mapping: F1=100% (High), F2/Auto=50% (Low)
-        switch (state.windSpeed) {
-          case 1: return 100;  // F1 = 100% (High speed)
-          case 2:
-          case 0:
-          default: return 50;   // F2/Auto = 50% (Low speed)
-        }
+
+      // TCL SN12P550:
+      // windSpeed 0 = AUTO
+      // windSpeed 2 = level 1/2
+      // windSpeed 3 = level 3
+      // windSpeed 4 = level 4
+      // windSpeed 5 = level 5
+      // windSpeed 6 = level 6/7
+      //
+      // Fan speed is independent from workMode.
+
+      switch (state.windSpeed) {
+        case 0:
+          return 0;
+        case 2:
+          return 20;
+        case 3:
+          return 33;
+        case 4:
+          return 50;
+        case 5:
+          return 67;
+        case 6:
+          return 100;
+        default:
+          return 0;
       }
-      
-      return 0; // No fan speed for other modes
     } catch (error) {
       this.log.error('❌ Error getting fan rotation speed:', error.message);
       return 0;
     }
   }
 
-  async setRotationSpeed(value) {
+    async setRotationSpeed(value) {
     try {
       const currentState = await this.platform.tclApi.getDeviceState(this.device.deviceId);
-      
-      // Convert percentage to hardware speed: 0-50% = F2 (Low), 51-100% = F1 (High)
+
+      // TCL SN12P550 fan mapping:
+      // HomeKit 0%      -> TCL Auto (0)
+      // HomeKit 1-16%   -> TCL speed 1/2 (2)
+      // HomeKit 17-33%  -> TCL speed 3 (3)
+      // HomeKit 34-50%  -> TCL speed 4 (4)
+      // HomeKit 51-66%  -> TCL speed 5 (5)
+      // HomeKit 67-83%  -> TCL speed 6 (6)
+      // HomeKit 84-100% -> TCL speed 7 (6)
+      //
+      // IMPORTANT: fan speed must NEVER change workMode.
+
       let fanSpeed;
       let fanName;
-      
-      if (value <= 50) {
-        fanSpeed = 2;  // F2 hardware
-        fanName = 'F2 (Low)';
+
+      if (value <= 0) {
+        fanSpeed = 0;
+        fanName = 'AUTO';
+      } else if (value <= 16) {
+        fanSpeed = 2;
+        fanName = '1/2';
+      } else if (value <= 33) {
+        fanSpeed = 3;
+        fanName = '3';
+      } else if (value <= 50) {
+        fanSpeed = 4;
+        fanName = '4';
+      } else if (value <= 66) {
+        fanSpeed = 5;
+        fanName = '5';
+      } else if (value <= 83) {
+        fanSpeed = 6;
+        fanName = '6/7';
       } else {
-        fanSpeed = 1;  // F1 hardware  
-        fanName = 'F1 (High)';
+        fanSpeed = 6;
+        fanName = '7';
       }
-      
-      let properties = {
+
+      // Only change windSpeed.
+      // Never change powerSwitch or workMode here.
+      const properties = {
         windSpeed: fanSpeed
       };
-      
-      // If device is off, turn it on with appropriate mode when setting fan speed
-      if (!currentState || !currentState.powerSwitch) {
-        this.log.info(`💨 AC FAN SPEED: Device is off, turning on in fan mode with ${fanName}`);
-        properties = {
-          powerSwitch: 1,
-          workMode: 2, // Pure fan mode
-          windSpeed: fanSpeed
-        };
-        this.fanModeFanSpeed = fanSpeed;
-      } else {
-        // Context-aware speed setting based on current mode
-        if (currentState.workMode === 2) {
-          // Pure fan mode - save to fan mode context
-          this.fanModeFanSpeed = fanSpeed;
-          this.log.info(`💨 AC FAN SPEED: Set to ${fanName} (${value}% → F${fanSpeed} for PURE FAN mode)`);
-        } else if (currentState.workMode === 0) {
-          // AC cooling mode - save to cool mode context  
-          this.coolModeFanSpeed = fanSpeed;
-          this.log.info(`❄️ AC FAN SPEED: Set to ${fanName} (${value}% → F${fanSpeed} for AC COOLING mode)`);
-        } else {
-          this.log.info(`💨 AC FAN SPEED: Unsupported mode ${currentState.workMode}, switching to fan mode`);
-          properties = {
-            powerSwitch: 1,
-            workMode: 2, // Switch to pure fan mode
-            windSpeed: fanSpeed
-          };
-          this.fanModeFanSpeed = fanSpeed;
-        }
-      }
-      
+
+      this.log.info(
+        `💨 AC FAN SPEED: ${value}% → TCL windSpeed=${fanSpeed} (${fanName}), keeping workMode=${currentState?.workMode}`
+      );
+
       const success = await this.executeWithAWSRetry(
         () => this.platform.tclApi.setDeviceState(this.device.deviceId, properties),
         'setRotationSpeed'
       );
-      
+
       if (success) {
-        // Force immediate status update after 1 second
         setTimeout(async () => {
           try {
-            const newState = await this.platform.tclApi.getDeviceState(this.device.deviceId);
+            const newState = await this.platform.tclApi.getDeviceState(
+              this.device.deviceId,
+              true
+            );
+
             if (newState) {
               this.updateHomeKitFromState(newState);
             }
           } catch (error) {
-            this.platform.tclApi.debug('Error in delayed fan speed status update:', error.message);
+            this.platform.tclApi.debug(
+              'Error in delayed fan speed status update:',
+              error.message
+            );
           }
         }, 1000);
+      } else {
+        throw new Error('Failed to set fan speed');
       }
     } catch (error) {
       this.log.error('❌ Error setting fan rotation speed:', error.message);
-      throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+      throw new this.platform.api.hap.HapStatusError(
+        this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE
+      );
     }
   }
-  
+
   startPolling() {
     // Use fast polling frequency for responsive manual device changes
     setInterval(async () => {
